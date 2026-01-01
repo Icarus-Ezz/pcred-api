@@ -88,7 +88,32 @@ def check_key():
         return jsonify({"status": "invalid"})
             
     return jsonify({"status": "ok", "reward": info["reward"]})
+@app.route("/create_code", methods=["POST"])
+def create_code():
+    raw = request.headers.get("X-API-KEY")
+    if not raw or hash_api_key(raw) not in API_KEYS_HASHED:
+        return jsonify({"status": "error", "msg": "Invalid API KEY"}), 401
+        
+    data = request.get_json(silent=True)
+    code = data.get("code")
+    discord_id = str(data.get("discord_id"))
+    reward = int(data.get("reward", 350)) # Reward mặc định
 
+    if not code or not discord_id:
+        return jsonify({"status": "error", "msg": "Missing data"})
+
+    # Lưu vào DB
+    new_doc = {
+        "code": code,
+        "discord_id": discord_id,
+        "reward": reward,
+        "state": "unused",
+        "created_at": now().strftime(TIME_FMT),
+        "expire_at": (now() + timedelta(hours=24)).strftime(TIME_FMT),
+        "used_at": None
+    }
+    codes_col.insert_one(new_doc)
+    return jsonify({"status": "ok"})
 @app.route("/generate_code", methods=["POST"])
 def generate_code_api():
     data = request.get_json(silent=True)
