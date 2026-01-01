@@ -156,5 +156,5 @@ def redeem():
     return jsonify({"status": "success", "balance": tien[discord_id]})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 20062))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
