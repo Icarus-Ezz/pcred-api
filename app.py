@@ -1,31 +1,35 @@
+import os
+import time
+import hmac
+import random
+import string
+import hashlib
+import threading
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from datetime import datetime, timedelta
-import json, os, time, threading
-import hashlib, hmac, random, string
+from pymongo import MongoClient
 
 app = Flask(__name__)
 CORS(app)
 
-# ================= CONFIG =================
-DATA_DIR = "data"
-CODES_FILE = os.path.join(DATA_DIR, "codes.json")
-TIEN_FILE = os.path.join(DATA_DIR, "tien.json")
+# ================= CONFIG & DATABASE =================
+# Lấy URI từ Environment Variable trên Render (để bảo mật)
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://ngongochungphat_db_user:pPY7Hi7fxsyuHCDB@phatcrystal.tfss1qn.mongodb.net/?appName=PhatCrystal")
+client = MongoClient(MONGO_URI)
+db = client["pcred_db"]
+
+# Collections thay thế cho các file .json
+codes_col = db["codes"]
+tien_col = db["tien"]
 
 API_SECRET_SALT = "PCRED_PRIVATE_SALT_2025"
 RAW_API_KEYS = ["Sikibidisigama"]
-
-RATE_LIMIT = 15
-RATE_TIME = 60
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
 rate_cache = {}
-file_lock = threading.Lock()
 
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-# ================= UTIL =================
+# ================= UTILS =================
 def now():
     return datetime.now()
 
@@ -38,47 +42,27 @@ def hash_api_key(key):
 
 API_KEYS_HASHED = {hash_api_key(k) for k in RAW_API_KEYS}
 
-def load_json(path):
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({}, f)
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-def clean_expired_codes(codes):
-    t = now()
-    for code in list(codes.keys()):
-        try:
-            expire_t = datetime.strptime(codes[code]["expire_at"], TIME_FMT)
-            if t >= expire_t:
-                del codes[code]
-        except:
-            del codes[code]
+def clean_expired_codes():
+    """Xóa các code hết hạn trong database"""
+    t_now = now().strftime(TIME_FMT)
+    codes_col.delete_many({"expire_at": {"$lt": t_now}, "state": "unused"})
 
 # ================= SECURITY =================
 @app.before_request
 def security_check():
     if request.method == "OPTIONS": return
     
-    # Rate Limit
+    # Rate Limit (15 req / 60s)
     ip = request.remote_addr
     now_t = time.time()
-    history = [t for t in rate_cache.get(ip, []) if now_t - t < RATE_TIME]
-    if len(history) >= RATE_LIMIT:
+    history = [t for t in rate_cache.get(ip, []) if now_t - t < 60]
+    if len(history) >= 15:
         return jsonify({"status": "error", "msg": "Too many requests"}), 429
     history.append(now_t)
     rate_cache[ip] = history
 
-    # API Key Check (Chỉ cho các route đặc biệt)
-    protected_paths = ["/create_code", "/generate_code", "/redeem"]
+    # API Key Check cho các route quản trị
+    protected_paths = ["/create_code", "/generate_code"]
     if request.path in protected_paths:
         raw = request.headers.get("X-API-KEY")
         if not raw or hash_api_key(raw) not in API_KEYS_HASHED:
@@ -87,22 +71,21 @@ def security_check():
 # ================= ROUTES =================
 @app.route("/")
 def home():
-    return "PCRED API IS LIVE"
+    return "PCRED API MONGODB LIVE - PYTHON 3.12"
 
 @app.route("/check_key", methods=["POST"])
 def check_key():
+    clean_expired_codes()
     data = request.get_json(silent=True)
     if not data or "code" not in data:
         return jsonify({"status": "invalid"})
 
     code = data["code"].strip()
-    with file_lock:
-        codes = load_json(CODES_FILE)
-        clean_expired_codes(codes)
-        info = codes.get(code)
-        
-        if not info or info["state"] != "unused":
-            return jsonify({"status": "invalid"})
+    # Tìm code trong MongoDB
+    info = codes_col.find_one({"code": code, "state": "unused"})
+    
+    if not info:
+        return jsonify({"status": "invalid"})
             
     return jsonify({"status": "ok", "reward": info["reward"]})
 
@@ -115,20 +98,19 @@ def generate_code_api():
     if not discord_id:
         return jsonify({"status": "error", "msg": "Missing discord_id"})
 
-    with file_lock:
-        codes = load_json(CODES_FILE)
-        clean_expired_codes(codes)
-        code = generate_code()
-        created = now()
-        codes[code] = {
-            "discord_id": discord_id,
-            "reward": reward,
-            "state": "unused",
-            "created_at": created.strftime(TIME_FMT),
-            "expire_at": (created + timedelta(hours=24)).strftime(TIME_FMT),
-            "used_at": None
-        }
-        save_json(CODES_FILE, codes)
+    code = generate_code()
+    created = now()
+    
+    new_doc = {
+        "code": code,
+        "discord_id": discord_id,
+        "reward": reward,
+        "state": "unused",
+        "created_at": created.strftime(TIME_FMT),
+        "expire_at": (created + timedelta(hours=24)).strftime(TIME_FMT),
+        "used_at": None
+    }
+    codes_col.insert_one(new_doc)
 
     return jsonify({"status": "ok", "code": code, "reward": reward})
 
@@ -138,23 +120,29 @@ def redeem():
     code = data.get("code")
     discord_id = str(data.get("discord_id"))
 
-    with file_lock:
-        codes = load_json(CODES_FILE)
-        tien = load_json(TIEN_FILE)
-        info = codes.get(code)
+    # Tìm code và kiểm tra sở hữu
+    info = codes_col.find_one({"code": code, "state": "unused", "discord_id": discord_id})
 
-        if not info or info["state"] != "unused" or info["discord_id"] != discord_id:
-            return jsonify({"status": "error", "msg": "Code không hợp lệ hoặc đã dùng"})
+    if not info:
+        return jsonify({"status": "error", "msg": "Code không hợp lệ hoặc đã dùng"})
 
-        tien[discord_id] = tien.get(discord_id, 0) + info["reward"]
-        info["state"] = "used"
-        info["used_at"] = now().strftime(TIME_FMT)
+    # Cập nhật tiền (Nếu chưa có thì tạo mới bằng upsert)
+    tien_col.update_one(
+        {"discord_id": discord_id},
+        {"$inc": {"balance": info["reward"]}},
+        upsert=True
+    )
 
-        save_json(CODES_FILE, codes)
-        save_json(TIEN_FILE, tien)
+    # Đánh dấu code đã dùng
+    codes_col.update_one(
+        {"code": code},
+        {"$set": {"state": "used", "used_at": now().strftime(TIME_FMT)}}
+    )
 
-    return jsonify({"status": "success", "balance": tien[discord_id]})
+    updated_user = tien_col.find_one({"discord_id": discord_id})
+    return jsonify({"status": "success", "balance": updated_user["balance"]})
 
 if __name__ == "__main__":
+    # Render tự cấp PORT, nếu chạy local dùng 10000
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
